@@ -1,0 +1,246 @@
+Map modules = [:]
+script {
+  properties(
+    [
+      parameters([
+        string(defaultValue: 'development', name: 'WORKSPACE', description: 'setting up workspace for terraform'),
+        string(defaultValue: 'learning-cicd', name: 'SLACK', description: 'Slack Workspace'),
+        string(defaultValue: 'conan736', name: 'dockerhub_user', description: 'Username of DockerHub Account')
+      ])
+    ]
+  )
+}
+
+def path = "modules/app"
+
+pipeline {
+  agent any 
+  tools {
+    "org.jenkinsci.plugins.terraform.TerraformInstallation" "terraform"
+  }
+
+  environment {
+    TF_HOME = tool('terraform')
+    TP_LOG = "WARN"
+    PATH = "$TF_HOME:$PATH"
+    ACCESS_KEY = credentials('AWS_ACCESS_KEY_ID')
+    SECRET_KEY = credentials('AWS_SECRET_ACCESS_KEY')
+  }
+
+  stages{
+    stage('GitGuardian Scan') {
+      agent {
+        docker { image 'gitguardian/ggshield:latest'}
+      }
+      environment {
+        GITGUARDIAN_API_KEY = credentials('gitguardian-api-key')
+      } 
+      steps {
+        dir('files/') {
+          script {
+            try {
+              sh 'ggshield secret scan ci'
+            } catch (err) {
+              sh "rm terraform.tfstate.backup"
+            }
+          }
+        }
+      }
+    }
+    stage('Development Environment') {
+      stages {
+        stage('Preparing Build') {
+          parallel {
+            stage('Application Test Locally') {
+              stages {
+                stage('Docker Build') {
+                  steps {
+                  dir('files/') {
+                    script {
+                      modules.slack = load "slack_notif.groovy"
+                      modules.slack.envDevStart()
+                      }
+                    sh "docker build -t ${params.dockerhub_user}/jenkins:3.1 ${path}"
+                    }
+                  }
+                }
+                stage('Archive Flask App') {
+                  steps {
+                    dir('files/') {
+                      sh "cat ${path}/app.py > ${path}/app.txt"
+                      archiveArtifacts allowEmptyArchive: true, artifacts: "${path}/app.txt", followSymlinks: false
+                    }
+                  }
+                }
+                stage('Docker Push the Image') {
+                  steps {
+                    dir('files/') {
+                      withCredentials([usernamePassword(credentialsId: 'DockerHub', passwordVariable: 'dockerHubPass', usernameVariable: 'dockerHubUser')]) {
+                        sh "docker login -u ${env.dockerHubUser} -p ${env.dockerHubPass}"
+                        sh "docker push ${params.dockerhub_user}/jenkins:3.1"
+                      }
+                    }
+                  }
+                }
+                stage('Deploy on Dev Env') {
+                  steps {
+                    dir('files/') {
+                      script {
+                        try {
+                          def run_dev
+                          modules.function = load "deploy_container.groovy"
+                          modules.function.deploy()
+                        } catch (err) {
+                          modules.slack.notifyPipeline(currentBuild.result)
+                        }
+                          modules.slack.envDevDeploy(currentBuild.result)              
+                      }
+                    }
+                  }
+                }
+                stage('Remove App on Dev Env') {
+                  steps {
+                    dir('files/') {
+                      sh "sleep 5"
+                      sh "echo curling the web server"
+                      sh "curl localhost:5002"
+                      sh "docker rm -f flask_from_jenkins"
+                    }
+                  }
+                }
+              }
+            }
+            stage('Preparing AMI and Infrastructure') {
+              stages {
+                stage('Preparing AMI Packer') {
+                  steps {
+                    dir('files/packer/') {
+                      script {
+                        modules.slack = load "../slack_notif.groovy"
+                        modules.slack.packerBuild()                    
+                      }
+                      sh """
+                        packer build \
+                        -var "aws_access_key=$ACCESS_KEY" \
+                        -var "aws_secret_key=$SECRET_KEY" \
+                        -var-file="variables.pkrvars.hcl" .
+                      """
+                    }
+                  }
+                }
+                stage('TerraformInit') {
+                  steps {
+                    dir('files/') {
+                      sh """
+                      terraform init -upgrade -input=false
+                      whoami
+                      """
+                    }
+                  }
+                }
+                stage('TerraformFormat') {
+                  steps {
+                    dir('files/') {
+                      sh "terraform fmt -list=true -write=false -diff=true -check=true"
+                    }
+                  }
+                }
+                stage('TerraformValidate') {
+                  steps {
+                    dir('files/') {
+                      sh "terraform validate"
+                    }
+                  }
+                }
+                stage('TerraformPlan') {
+                  steps {
+                    dir('files/') {
+                      script {
+                        try {
+                          sh "terraform workspace new ${params.WORKSPACE}"
+                        } catch (err) {
+                          sh "terraform workspace select ${params.WORKSPACE}"
+                        }               
+                        sh "terraform plan -var 'access_key=$ACCESS_KEY' -var 'secret_key=$SECRET_KEY' \
+                        -out terraform.tfplan;echo \$? > status"
+                        stash name: "terraform-plan", includes: "terraform.tfplan"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Production Environment') {
+      stages {
+        stage('TerraformApply') {
+          steps {
+            script {
+              def apply = false
+              modules.slack.requireApproval()
+              try {
+                input message: 'Can you please confirm the apply', ok: 'Ready to apply the config of terraform'
+                apply = true
+              } catch (err) {
+                apply = false 
+                currentBuild.result = 'UNSTABLE'
+              }
+              if(apply) {
+                dir('files/') {
+                  unstash "terraform-plan"
+                  try {
+                    sh 'terraform apply terraform.tfplan'
+                    sh 'sleep 5m'
+                  } catch (err) {
+                    sh "terraform destroy -auto-approve \
+                    -var 'access_key=$ACCESS_KEY' \
+                    -var 'secret_key=$SECRET_KEY'"
+                  }
+                }
+              }
+            }
+          }
+        }
+        stage('TerraformDestroy') {
+          steps {
+            dir('files/') {
+              sh "terraform destroy -auto-approve \
+              -var 'access_key=$ACCESS_KEY' \
+              -var 'secret_key=$SECRET_KEY'"
+            }
+          }
+        }
+        stage('Remove AMI and Volume Resource') {
+          steps {
+            dir('files/python/') {
+              withPythonEnv('/usr/bin/python3') {
+                withAWS(credentials:'AwsAccount') {
+                  sh """
+                  python3 clean_resources.py
+                  """
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+  }
+
+  post {
+    always {
+      script {
+        if (currentBuild.result == 'SUCCESS') {
+          modules.slack.notifyPipeline(currentBuild.result)
+        } else {
+          modules.slack.notifyPipeline(currentBuild.result)
+        }
+        cleanWs()
+      }
+    }
+  }
+}
