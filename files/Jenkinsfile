@@ -28,25 +28,6 @@ pipeline {
   }
 
   stages{
-    stage('GitGuardian Scan') {
-      agent {
-        docker { image 'gitguardian/ggshield:latest'}
-      }
-      environment {
-        GITGUARDIAN_API_KEY = credentials('gitguardian-api-key')
-      } 
-      steps {
-        dir('files/') {
-          script {
-            try {
-              sh 'ggshield secret scan ci'
-            } catch (err) {
-              sh "rm terraform.tfstate.backup"
-            }
-          }
-        }
-      }
-    }
     stage('Development Environment') {
       stages {
         stage('Preparing Build') {
