@@ -82,9 +82,7 @@ pipeline {
                 stage('Remove App on Dev Env') {
                   steps {
                     dir('files/') {
-                      sh "sleep 5"
-                      sh "echo curling the web server"
-                      sh "curl localhost:5002"
+                      sh "sleep 5m"
                       sh "docker rm -f flask_from_jenkins"
                     }
                   }
@@ -194,12 +192,13 @@ pipeline {
             }
           }
         }
-        stage('Remove AMI and Volume Resource') {
+        stage('Remove AMI Resource') {
           steps {
             dir('files/python/') {
               withPythonEnv('/usr/bin/python3') {
                 withAWS(credentials:'AwsAccount') {
                   sh """
+                  aws configure set region "ap-southeast-1"
                   python3 clean_resources.py
                   """
                 }
